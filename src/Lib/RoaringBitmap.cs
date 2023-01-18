@@ -55,7 +55,7 @@ public sealed class RoaringBitmap : IDisposable, IEnumerable<uint>
             var highestLow = _containers[highestHigh] switch
             {
                 { SortedSet: { } sorted } => sorted.LastOrDefault(),
-                { Bitmap: { } bitmap } => (ushort)bitmap.Cast<bool>().Zip(Enumerable.Range(0, bitmap.Count)).LastOrDefault(pair => pair.First).Second,
+                { Bitmap: { } bitmap } => (ushort)bitmap.Cast<bool>().Zip(Enumerable.Range(0, bitmap.Count - 1)).LastOrDefault(pair => pair.First).Second,
                 _ => throw new ArgumentOutOfRangeException()
             };
             return (uint)highestHigh << 16 | highestLow;
@@ -68,7 +68,7 @@ public sealed class RoaringBitmap : IDisposable, IEnumerable<uint>
 
     private record Container
     {
-        public uint Cardinality => SortedSet is { } ? (uint)SortedSet.Count : 2^15;
+        public uint Cardinality => SortedSet is { } ? (uint)SortedSet.Count : ushort.MaxValue;
 
         public SortedSet<ushort>? SortedSet { get; set; }
         public BitArray? Bitmap { get; set; }
@@ -124,7 +124,7 @@ public sealed class RoaringBitmap : IDisposable, IEnumerable<uint>
 
     public bool Contains(uint value)
     {
-        var (key, shortValue) = GetKeyValuePair(value);
+        var (key, shortValue) = GetHighLow(value);
         if (!_containers.TryGetValue(key, out var container)) return false;
         return container switch
         {
@@ -150,7 +150,7 @@ public sealed class RoaringBitmap : IDisposable, IEnumerable<uint>
         => throw new NotImplementedException();
 
     public RoaringBitmap And(RoaringBitmap bitmap)
-        => throw new NotImplementedException();
+        => And(_containers, bitmap._containers);
 
     public void ApplyAnd(RoaringBitmap bitmap)
         => throw new NotImplementedException();
@@ -167,7 +167,6 @@ public sealed class RoaringBitmap : IDisposable, IEnumerable<uint>
     public ulong AndNotCardinality(RoaringBitmap bitmap)
         => throw new NotImplementedException();
 
-    
     public RoaringBitmap Or(RoaringBitmap bitmap)
         => throw new NotImplementedException();
     
@@ -257,7 +256,7 @@ public sealed class RoaringBitmap : IDisposable, IEnumerable<uint>
         for (var i = min; i < max; i += step) yield return i;
     }
     
-    private static (ushort key, ushort shortValue) GetKeyValuePair(uint value) =>
+    private static (ushort high, ushort low) GetHighLow(uint value) =>
         ((ushort)(value >>> 16), (ushort)(value & ushort.MaxValue));
     
     private static void Add(ConcurrentDictionary<ushort, Container> containers, ref uint[] values, uint offset,
@@ -271,9 +270,9 @@ public sealed class RoaringBitmap : IDisposable, IEnumerable<uint>
     
     private static void Add(ConcurrentDictionary<ushort, Container> containers, uint value)
     {
-        var (key, shortValue) = GetKeyValuePair(value);
+        var (high, low) = GetHighLow(value);
         // TODO: Using SortedSet may not perform well as it's using a red/black tree rather than a packed array
-        var container = containers.GetOrAdd(key, _ => Container.Empty());
+        var container = containers.GetOrAdd(high, _ => Container.Empty());
         // Add to container, possibly swapping SortedSet for a bitmap
         if (container.Cardinality >= 4096)
         {
@@ -283,13 +282,13 @@ public sealed class RoaringBitmap : IDisposable, IEnumerable<uint>
                 // TODO: This is poor logic encapsulation...
                 case { SortedSet: { } sorted }:
                     var newBitmap = CreateBitmap(sorted);
-                    newBitmap.Set(shortValue, true);
-                    if (!containers.TryUpdate(key, Container.WithBitmap(newBitmap), container))
+                    newBitmap.Set(low, true);
+                    if (!containers.TryUpdate(high, Container.WithBitmap(newBitmap), container))
                         // TODO: threading
                         throw new InvalidOperationException("Inconsistent container state");
                     break;
                 case { Bitmap: { } bitmap }:
-                    bitmap.Set(shortValue, true);
+                    bitmap.Set(low, true);
                     break;
                 default:
                     throw new NotImplementedException("Add not implemented for type");
@@ -299,7 +298,7 @@ public sealed class RoaringBitmap : IDisposable, IEnumerable<uint>
         {
             // TODO: At some point think about thread safety
             Debug.Assert(container.SortedSet != null, "container.SortedSet != null");
-            container.SortedSet.Add(shortValue);
+            container.SortedSet.Add(low);
         }
     }
     
@@ -314,7 +313,7 @@ public sealed class RoaringBitmap : IDisposable, IEnumerable<uint>
 
     private static void Remove(ConcurrentDictionary<ushort, Container> containers, uint value)
     {
-        var (key, shortValue) = GetKeyValuePair(value);
+        var (key, shortValue) = GetHighLow(value);
         if (!containers.TryGetValue(key, out var container)) return;
         switch (container)
         {
@@ -426,10 +425,39 @@ public sealed class RoaringBitmap : IDisposable, IEnumerable<uint>
             (isStrict && a.IsProperSubsetOf(b)) || a.IsSubsetOf(b);
     }
 
+    private static RoaringBitmap And(ConcurrentDictionary<ushort, Container> containersA, ConcurrentDictionary<ushort, Container> containersB)
+    {
+        RoaringBitmap? result = default;
+        // Match up all matching keys in both dictionaries, non-matching are ignored since we're ANDing
+        // AND together each individual container, so only values present in both are added to new container
+        var matching = containersA.Keys.Intersect(containersB.Keys);
+        foreach (var key in matching)
+        {
+            var containerA = containersA[key];
+            var containerB = containersB[key];
+            switch (containerA)
+            {
+                case { SortedSet: { } sortedA } when containerB is { SortedSet: { } sortedB }:
+                    result = FromValues(sortedA.Intersect(sortedB).Select(low => (uint)key << 16 | low)
+                        .ToArray());
+                    break;
+                case { Bitmap: { } bitmapA } when containerB is { Bitmap: { } bitmapB }:
+                    var overlap = bitmapA.And(bitmapB);
+                    result = FromValues(overlap.Cast<bool>().Zip(Enumerable.Range(0, overlap.Count - 1))
+                        .Where(pair => pair.First).Select(pair => (uint)key << 16 | (ushort)pair.Second).ToArray());
+                    break;
+                default:
+                    throw new NotImplementedException("Need to implement cross-type AND");
+            }
+        }
+
+        return result ?? throw new InvalidOperationException();
+    }
+
     private static BitArray CreateBitmap(SortedSet<ushort> values)
     {
         // TODO: Check my math here, but we should be able to just allocate ushort max / 8 to get bytes we need
-        var bitmap = new BitArray(ushort.MaxValue / 8);
+        var bitmap = new BitArray(ushort.MaxValue);
         foreach (var value in values)
             bitmap.Set(value, true);
 
@@ -480,7 +508,7 @@ public sealed class RoaringBitmap : IDisposable, IEnumerable<uint>
             _currentContainerEnumerator ??= _containersEnumerator.Current.Value switch
             {
                 { SortedSet: { } sorted } => sorted.GetEnumerator(),
-                { Bitmap: { } bitmap } => bitmap.GetEnumerator(),
+                { Bitmap: { } bitmap } => new BitArrayPositionEnumerator(bitmap),
                 _ => throw new InvalidOperationException()
             };
 
@@ -514,6 +542,45 @@ public sealed class RoaringBitmap : IDisposable, IEnumerable<uint>
             if (Interlocked.Increment(ref _disposedCount) != 1) return;
             _currentContainerEnumerator = null;
             _containersEnumerator.Dispose();
+        }
+
+        private class BitArrayPositionEnumerator : IEnumerator<ushort>
+        {
+            private readonly ushort _length;
+            private ushort _index;
+
+            public BitArrayPositionEnumerator(ICollection bitArray)
+            {
+                if (bitArray.Count > ushort.MaxValue)
+                    throw new InvalidOperationException("BitArray is larger than ushort");
+                _length = (ushort)(bitArray.Count - 1);
+            }
+            
+            /// <inheritdoc />
+            public bool MoveNext()
+            {
+                if (_index >= _length)
+                    return false;
+                _index++;
+                return true;
+            }
+
+            /// <inheritdoc />
+            public void Reset()
+            {
+                _index = 0;
+            }
+
+            /// <inheritdoc />
+            public ushort Current => _index;
+
+            /// <inheritdoc />
+            object IEnumerator.Current => Current;
+
+            /// <inheritdoc />
+            public void Dispose()
+            {
+            }
         }
     }
 }

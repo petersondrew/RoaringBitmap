@@ -92,6 +92,10 @@ namespace Test.CRoaring.Net
                     Assert.False(rb3.Contains(i));
                 }
             }
+
+            var bigValues = Enumerable.Range(0, 9001).Select(i => (uint)i).ToArray();
+            using var rb4 = RoaringBitmap.FromValues(bigValues);
+            bigValues.Should().AllSatisfy(v => rb4.Contains(v).Should().BeTrue());
         }
 
         [Fact]
@@ -172,16 +176,23 @@ namespace Test.CRoaring.Net
             var values1 = new uint[] { 1, 2, 3, 4, 5, 100, 1000 };
             var values2 = new uint[] { 1, 2, 3, 4, 5, 100, 1000 };
             var values3 = new uint[] { 3, 4, 5, 7, 100, 1020 };
+            var values4 = Enumerable.Range(0, 7000).Select(i => (uint)i).ToArray();
+            var values5 = Enumerable.Range(0, 9000).Select(i => (uint)i).ToArray();
 
             using var source1 = RoaringBitmap.FromValues(values1);
             using var source2 = RoaringBitmap.FromValues(values2);
             using var source3 = RoaringBitmap.FromValues(values3);
+            using var source4 = RoaringBitmap.FromValues(values4);
+            using var source5 = RoaringBitmap.FromValues(values5);
             using var result1 = source1.And(source2);
             using var result2 = source2.And(source3);
             using var result3 = result1.And(source3);
+            using var result4 = source4.And(source5);
             Assert.Equal(result1.Cardinality, AndCount(values1, values2));
             Assert.Equal(result2.Cardinality, AndCount(values2, values3));
             Assert.Equal(result3.Cardinality, AndCount(values1, values2, values3));
+            values4.Should().AllSatisfy(v => result4.Contains(v).Should().BeTrue());
+            values5.Should().AllSatisfy(v=> result4.Contains(v).Should().Be(values4.Contains(v)));
         }
         [Fact]
         public void TestIAnd()
