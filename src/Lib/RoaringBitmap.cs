@@ -377,10 +377,7 @@ public sealed class RoaringBitmap : IDisposable, IEnumerable<uint>
     /// <exception cref="NotImplementedException"></exception>
     private static bool IsSubset(ConcurrentDictionary<ushort, Container> maybeSubset, ConcurrentDictionary<ushort, Container> containers, bool isStrict = false)
     {
-        // TODO: What does isStrict mean?
         // TODO: We need to support maybeSubset being a different (smaller) type than containers
-        
-        // TODO: We should probably instead check to make sure to only check keys where container cardinality is > 0
 
         var maybeSubsetCount = maybeSubset.Count(NonEmptyContainers);
         var containersCount = containers.Count(NonEmptyContainers);
@@ -480,15 +477,13 @@ public sealed class RoaringBitmap : IDisposable, IEnumerable<uint>
         
         private IEnumerator GetCurrentContainerEnumerator()
         {
-            // var moveNext = _currentContainerEnumerator is null;
             _currentContainerEnumerator ??= _containersEnumerator.Current.Value switch
             {
                 { SortedSet: { } sorted } => sorted.GetEnumerator(),
                 { Bitmap: { } bitmap } => bitmap.GetEnumerator(),
                 _ => throw new InvalidOperationException()
             };
-            // if (moveNext)
-            //     _currentContainerEnumerator.MoveNext();
+
             return _currentContainerEnumerator;
         }
 
